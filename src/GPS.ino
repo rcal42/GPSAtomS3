@@ -3,22 +3,18 @@
  * @brief M5AtomS3 Atomic GPS Base v2.0 with Display
  *
  * @Hardware: M5AtomS3 + Atomic GPS Base v2.0 (115200 baud)
+ * Uses MultipleSatellite library for multi-constellation support
  */
 
 #include "M5AtomS3.h"
-#include <TinyGPSPlus.h>
+#include "MultipleSatellite.h"
 
-TinyGPSPlus gps;
+// GPS Base v2.0 pins and baud rate
+static const int RXPin = 5, TXPin = -1;
+static const uint32_t GPSBaud = 115200;
 
-// Feed GPS data while waiting
-static void smartDelay(unsigned long ms) {
-    unsigned long start = millis();
-    do {
-        while (Serial2.available()) {
-            gps.encode(Serial2.read());
-        }
-    } while (millis() - start < ms);
-}
+// Create MultipleSatellite instance using Serial2
+MultipleSatellite gps(Serial2, GPSBaud, SERIAL_8N1, RXPin, TXPin);
 
 void updateDisplay() {
     AtomS3.Display.fillScreen(BLACK);
@@ -109,9 +105,7 @@ void setup() {
     Serial.begin(115200);
     Serial.println("GPS Starting...");
 
-    // GPS Base v2.0 uses 115200 baud on GPIO5 (RX)
-    Serial2.begin(115200, SERIAL_8N1, 5, -1);
-
+    // Show splash screen
     AtomS3.Display.fillScreen(BLACK);
     AtomS3.Display.setTextColor(GREEN);
     AtomS3.Display.setTextDatum(middle_center);
@@ -119,10 +113,17 @@ void setup() {
     AtomS3.Display.drawString("GPS", AtomS3.Display.width() / 2,
                               AtomS3.Display.height() / 2);
 
+    // Initialize GPS (keep it simple - advanced commands may block)
+    gps.begin();
+    Serial.println("GPS initialized");
+
     delay(1000);
 }
 
 void loop() {
+    // Update GPS data
+    gps.updateGPS();
+
     // Update display
     updateDisplay();
 
@@ -149,5 +150,5 @@ void loop() {
         Serial.println("No GPS data received: check wiring");
     }
 
-    smartDelay(1000);
+    delay(100);
 }
