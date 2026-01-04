@@ -50,23 +50,25 @@ void updateDisplay() {
     }
     y += 18;
 
-    // Show coordinates (right-justified, 4 decimal places)
+    // Show coordinates (monospace, right-justified, 5 decimal places)
+    AtomS3.Display.setFont(&fonts::FreeMono9pt7b);
     AtomS3.Display.setTextColor(WHITE);
     AtomS3.Display.setCursor(5, y);
     if (gps.location.isValid()) {
-        AtomS3.Display.printf("Lat:%9.4f", gps.location.lat());
+        AtomS3.Display.printf("%10.5f", gps.location.lat());
     } else {
-        AtomS3.Display.print("Lat:   --    ");
+        AtomS3.Display.print("   --    ");
     }
     y += 16;
 
     AtomS3.Display.setCursor(5, y);
     if (gps.location.isValid()) {
-        AtomS3.Display.printf("Lon:%9.4f", gps.location.lng());
+        AtomS3.Display.printf("%10.5f", gps.location.lng());
     } else {
-        AtomS3.Display.print("Lon:   --    ");
+        AtomS3.Display.print("   --    ");
     }
     y += 18;
+    AtomS3.Display.setFont(&fonts::Font2);
 
     // Show time if valid
     AtomS3.Display.setCursor(5, y);
