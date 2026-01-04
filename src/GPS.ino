@@ -9,6 +9,7 @@
 #include "M5AtomS3.h"
 #include "MultipleSatellite.h"
 #include <Preferences.h>
+#include <NimBLEDevice.h>
 
 // GPS Base v2.0 pins and baud rate
 static const int RXPin = 5, TXPin = -1;
@@ -16,6 +17,23 @@ static const uint32_t GPSBaud = 115200;
 
 // Create MultipleSatellite instance using Serial2
 MultipleSatellite gps(Serial2, GPSBaud, SERIAL_8N1, RXPin, TXPin);
+
+// BLE Nordic UART Service (NUS) UUIDs
+#define SERVICE_UUID        "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
+#define CHARACTERISTIC_UUID_TX "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
+
+// BLE objects
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pTxCharacteristic = nullptr;
+bool bleConnected = false;
+uint32_t bleConnectedCount = 0;
+unsigned long lastBleTransmit = 0;
+const unsigned long BLE_TRANSMIT_INTERVAL = 1000;  // Send GGA every 1 second
+
+// Device ID (derived from MAC address)
+char deviceName[20] = "AtomS3-GPS";
+char deviceId[5] = "";  // Last 4 hex digits of MAC
 
 // NVS storage for last known position
 Preferences prefs;
@@ -37,6 +55,184 @@ uint8_t brightnessIndex = 0;
 void displayMainView();
 void displaySatelliteView();
 void displaySpeedAltView();
+
+// Forward declaration for sending device info
+void sendBleDeviceInfo();
+
+// BLE Server Callbacks
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) {
+        bleConnected = true;
+        bleConnectedCount++;
+        Serial.println("BLE client connected");
+        // Send device info after a short delay (let connection stabilize)
+        delay(100);
+        sendBleDeviceInfo();
+    }
+
+    void onDisconnect(NimBLEServer* pServer) {
+        bleConnected = false;
+        Serial.println("BLE client disconnected");
+        // Restart advertising
+        NimBLEDevice::startAdvertising();
+    }
+};
+
+// Calculate NMEA checksum (XOR of all characters between $ and *)
+uint8_t calcNmeaChecksum(const char* sentence) {
+    uint8_t checksum = 0;
+    // Skip the leading '$'
+    for (int i = 1; sentence[i] != '*' && sentence[i] != '\0'; i++) {
+        checksum ^= sentence[i];
+    }
+    return checksum;
+}
+
+// Generate NMEA GGA sentence from current GPS data
+String generateGGA() {
+    char sentence[100];
+    char timeStr[12] = "000000.000";
+    char latStr[15] = "";
+    char latDir = 'N';
+    char lonStr[15] = "";
+    char lonDir = 'E';
+    int fixQuality = 0;
+    int numSats = 0;
+    float hdop = 99.9;
+    float altitude = 0.0;
+
+    // Time
+    if (gps.time.isValid()) {
+        snprintf(timeStr, sizeof(timeStr), "%02d%02d%02d.%03d",
+            gps.time.hour(), gps.time.minute(), gps.time.second(),
+            gps.time.centisecond() * 10);
+    }
+
+    // Position (convert decimal degrees to NMEA format: ddmm.mmmm)
+    if (gps.location.isValid()) {
+        double lat = gps.location.lat();
+        double lng = gps.location.lng();
+
+        latDir = (lat >= 0) ? 'N' : 'S';
+        lat = fabs(lat);
+        int latDeg = (int)lat;
+        double latMin = (lat - latDeg) * 60.0;
+        snprintf(latStr, sizeof(latStr), "%02d%09.6f", latDeg, latMin);
+
+        lonDir = (lng >= 0) ? 'E' : 'W';
+        lng = fabs(lng);
+        int lonDeg = (int)lng;
+        double lonMin = (lng - lonDeg) * 60.0;
+        snprintf(lonStr, sizeof(lonStr), "%03d%09.6f", lonDeg, lonMin);
+
+        fixQuality = 1;  // GPS fix
+    }
+
+    // Satellites
+    if (gps.satellites.isValid()) {
+        numSats = gps.satellites.value();
+    }
+
+    // HDOP
+    if (gps.hdop.isValid()) {
+        hdop = gps.hdop.hdop();
+    }
+
+    // Altitude
+    if (gps.altitude.isValid()) {
+        altitude = gps.altitude.meters();
+    }
+
+    // Build GGA sentence (without checksum)
+    snprintf(sentence, sizeof(sentence),
+        "$GPGGA,%s,%s,%c,%s,%c,%d,%02d,%.1f,%.1f,M,0.0,M,,*",
+        timeStr, latStr, latDir, lonStr, lonDir,
+        fixQuality, numSats, hdop, altitude);
+
+    // Calculate and append checksum
+    uint8_t cs = calcNmeaChecksum(sentence);
+    char result[110];
+    snprintf(result, sizeof(result), "%s%02X\r\n", sentence, cs);
+    // Remove the extra * that was in the template
+    String ggaStr = String(result);
+    ggaStr.replace("**", "*");
+
+    return ggaStr;
+}
+
+// Initialize BLE with Nordic UART Service
+void initBLE() {
+    // Get MAC address and create unique device ID (last 4 hex digits)
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_BT);
+    snprintf(deviceId, sizeof(deviceId), "%02X%02X", mac[4], mac[5]);
+    snprintf(deviceName, sizeof(deviceName), "AtomS3-GPS-%s", deviceId);
+
+    Serial.printf("Device ID: %s\n", deviceId);
+    Serial.printf("BLE Name: %s\n", deviceName);
+
+    NimBLEDevice::init(deviceName);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max power for range
+
+    pServer = NimBLEDevice::createServer();
+    pServer->setCallbacks(new ServerCallbacks());
+
+    NimBLEService* pService = pServer->createService(SERVICE_UUID);
+
+    // TX Characteristic - for sending data to client (notify)
+    pTxCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID_TX,
+        NIMBLE_PROPERTY::NOTIFY
+    );
+
+    // RX Characteristic - for receiving data from client (write)
+    pService->createCharacteristic(
+        CHARACTERISTIC_UUID_RX,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+    );
+
+    pService->start();
+
+    // Start advertising
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->start();
+
+    Serial.printf("BLE advertising started as '%s'\n", deviceName);
+}
+
+// Send GGA sentence over BLE
+void sendBleGGA() {
+    if (!bleConnected || !pTxCharacteristic) return;
+
+    String gga = generateGGA();
+    pTxCharacteristic->setValue((uint8_t*)gga.c_str(), gga.length());
+    pTxCharacteristic->notify();
+
+    Serial.print("BLE TX: ");
+    Serial.print(gga);
+}
+
+// Send device info over BLE (called on connect)
+void sendBleDeviceInfo() {
+    if (!bleConnected || !pTxCharacteristic) return;
+
+    // Send custom sentence with device ID: $PATOM,<deviceId>,<deviceName>*XX
+    char sentence[60];
+    snprintf(sentence, sizeof(sentence), "$PATOM,%s,%s*", deviceId, deviceName);
+    uint8_t cs = calcNmeaChecksum(sentence);
+    char msg[70];
+    snprintf(msg, sizeof(msg), "%s%02X\r\n", sentence, cs);
+    String infoStr = String(msg);
+    infoStr.replace("**", "*");
+
+    pTxCharacteristic->setValue((uint8_t*)infoStr.c_str(), infoStr.length());
+    pTxCharacteristic->notify();
+
+    Serial.print("BLE TX (info): ");
+    Serial.print(infoStr);
+}
 
 void updateDisplay() {
     switch (currentMode) {
@@ -71,6 +267,16 @@ void displayMainView() {
     } else {
         AtomS3.Display.setTextColor(YELLOW);
         AtomS3.Display.print("Sats: --");
+    }
+
+    // BLE status indicator (top right)
+    AtomS3.Display.setCursor(100, y);
+    if (bleConnected) {
+        AtomS3.Display.setTextColor(BLUE);
+        AtomS3.Display.print("BLE");
+    } else {
+        AtomS3.Display.setTextColor(DARKGREY);
+        AtomS3.Display.print("ble");
     }
     y += 18;
 
@@ -352,6 +558,9 @@ void setup() {
     gps.begin();
     Serial.println("GPS initialized");
 
+    // Initialize BLE beacon
+    initBLE();
+
     delay(1000);
 }
 
@@ -381,6 +590,12 @@ void loop() {
 
     // Update display
     updateDisplay();
+
+    // Send BLE GGA periodically when connected
+    if (bleConnected && (millis() - lastBleTransmit > BLE_TRANSMIT_INTERVAL)) {
+        lastBleTransmit = millis();
+        sendBleGGA();
+    }
 
     // Also output to serial for debugging
     if (gps.location.isValid()) {
